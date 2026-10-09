@@ -1,0 +1,374 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Generate project
+        run: |
+          mkdir -p $(dirname app/src/main/java/com/example/poolguide/MainActivity.kt)
+          cat > app/src/main/java/com/example/poolguide/MainActivity.kt <<'EOF_0'
+          package com.example.poolguide
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(48, 48, 48, 48)
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "مساعد خطوط البلياردو"
+                      textSize = 22f
+                      gravity = Gravity.CENTER
+                  })
+                  root.addView(Button(this).apply {
+                      text = "تشغيل"
+                      setOnClickListener {
+                          if (!Settings.canDrawOverlays(context)) {
+                              Toast.makeText(context, "فعّل «الظهور فوق التطبيقات» ثم ارجع واضغط تشغيل", Toast.LENGTH_LONG).show()
+                              startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                          } else {
+                              startService(Intent(context, OverlayService::class.java))
+                              moveTaskToBack(true)
+                          }
+                      }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "إيقاف"
+                      setOnClickListener { stopService(Intent(context, OverlayService::class.java)) }
+                  })
+                  setContentView(root)
+              }
+          }
+          EOF_0
+          mkdir -p $(dirname app/src/main/java/com/example/poolguide/OverlayService.kt)
+          cat > app/src/main/java/com/example/poolguide/OverlayService.kt <<'EOF_1'
+          package com.example.poolguide
+
+          import android.app.Service
+          import android.content.Intent
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+
+          class OverlayService : Service() {
+
+              private lateinit var wm: WindowManager
+              private lateinit var overlay: OverlayView
+              private lateinit var panel: LinearLayout
+              private lateinit var overlayParams: WindowManager.LayoutParams
+              private lateinit var panelParams: WindowManager.LayoutParams
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              private val type get() =
+                  if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+
+                  overlay = OverlayView(this)
+                  overlayParams = WindowManager.LayoutParams(
+                      -1, -1, type,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  wm.addView(overlay, overlayParams)
+
+                  panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(0x99000000.toInt())
+                  }
+                  panelParams = WindowManager.LayoutParams(
+                      -2, -2, type,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = 200 }
+
+                  fun btn(t: String, a: (Button) -> Unit): Button {
+                      val b = Button(this)
+                      b.text = t
+                      b.textSize = 16f
+                      b.minWidth = 0
+                      b.minimumWidth = 0
+                      b.setOnClickListener { a(b) }
+                      panel.addView(b, LinearLayout.LayoutParams(130, 130))
+                      return b
+                  }
+
+                  // زر السحب لتحريك اللوحة
+                  val move = btn("☰") {}
+                  var sx = 0f
+                  var sy = 0f
+                  var px = 0
+                  var py = 0
+                  move.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; px = panelParams.x; py = panelParams.y }
+                          MotionEvent.ACTION_MOVE -> {
+                              panelParams.x = px + (e.rawX - sx).toInt()
+                              panelParams.y = py + (e.rawY - sy).toInt()
+                              wm.updateViewLayout(panel, panelParams)
+                          }
+                      }
+                      true
+                  }
+
+                  // تعديل / لعب: في وضع اللعب تمر لمساتك إلى اللعبة والخط يبقى ظاهرًا
+                  btn("✎") { b ->
+                      overlay.editMode = !overlay.editMode
+                      if (overlay.editMode) {
+                          overlayParams.flags = overlayParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                          b.text = "✎"
+                      } else {
+                          overlayParams.flags = overlayParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          b.text = "▶"
+                      }
+                      wm.updateViewLayout(overlay, overlayParams)
+                      overlay.invalidate()
+                  }
+                  btn("＋") { overlay.addBend() }
+                  btn("－") { overlay.removeBend() }
+                  btn("⟲") { overlay.reset() }
+                  btn("✕") { stopSelf() }
+
+                  wm.addView(panel, panelParams)
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  runCatching { wm.removeView(overlay) }
+                  runCatching { wm.removeView(panel) }
+              }
+          }
+          EOF_1
+          mkdir -p $(dirname app/src/main/java/com/example/poolguide/OverlayView.kt)
+          cat > app/src/main/java/com/example/poolguide/OverlayView.kt <<'EOF_2'
+          package com.example.poolguide
+
+          import android.content.Context
+          import android.graphics.*
+          import android.view.MotionEvent
+          import android.view.View
+          import kotlin.math.*
+
+          class OverlayView(ctx: Context) : View(ctx) {
+
+              // أول نقطة = الكرة البيضاء، آخر نقطة = الجيب، وما بينهما نقاط كسر
+              val pts = mutableListOf<PointF>()
+              var editMode = true
+              private var drag = -1
+
+              private val shadow = Paint().apply {
+                  color = 0xAA000000.toInt(); strokeWidth = 12f
+                  style = Paint.Style.STROKE; isAntiAlias = true
+                  strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND
+              }
+              private val line = Paint().apply {
+                  color = Color.WHITE; strokeWidth = 6f
+                  style = Paint.Style.STROKE; isAntiAlias = true
+                  strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND
+              }
+              private val fill = Paint().apply { isAntiAlias = true }
+              private val label = Paint().apply {
+                  color = Color.YELLOW; textSize = 38f; isAntiAlias = true
+                  setShadowLayer(5f, 0f, 0f, Color.BLACK)
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  super.onSizeChanged(w, h, ow, oh)
+                  if (pts.isEmpty()) reset()
+              }
+
+              fun reset() {
+                  pts.clear()
+                  pts.add(PointF(width * 0.3f, height * 0.65f))
+                  pts.add(PointF(width * 0.7f, height * 0.3f))
+                  invalidate()
+              }
+
+              fun addBend() {
+                  var best = 0
+                  var bestLen = -1f
+                  for (i in 0 until pts.size - 1) {
+                      val l = hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y)
+                      if (l > bestLen) { bestLen = l; best = i }
+                  }
+                  val a = pts[best]
+                  val b = pts[best + 1]
+                  val len = max(bestLen, 1f)
+                  val nx = -(b.y - a.y) / len
+                  val ny = (b.x - a.x) / len
+                  val mx = (a.x + b.x) / 2
+                  val my = (a.y + b.y) / 2
+                  pts.add(best + 1, PointF(mx + nx * 90f, my + ny * 90f))
+                  invalidate()
+              }
+
+              fun removeBend() {
+                  if (pts.size > 2) {
+                      pts.removeAt(pts.size - 2)
+                      invalidate()
+                  }
+              }
+
+              override fun onDraw(c: Canvas) {
+                  if (pts.size < 2) return
+                  val path = Path()
+                  path.moveTo(pts[0].x, pts[0].y)
+                  for (i in 1 until pts.size) path.lineTo(pts[i].x, pts[i].y)
+                  c.drawPath(path, shadow)
+                  c.drawPath(path, line)
+
+                  // زاوية الكسر عند كل نقطة وسطية
+                  for (i in 1 until pts.size - 1) {
+                      val ax = pts[i].x - pts[i - 1].x
+                      val ay = pts[i].y - pts[i - 1].y
+                      val bx = pts[i + 1].x - pts[i].x
+                      val by = pts[i + 1].y - pts[i].y
+                      val d = hypot(ax, ay) * hypot(bx, by)
+                      if (d > 1f) {
+                          val cs = ((ax * bx + ay * by) / d).coerceIn(-1f, 1f)
+                          val deg = Math.toDegrees(acos(cs).toDouble()).roundToInt()
+                          c.drawText("$deg°", pts[i].x + 30f, pts[i].y - 30f, label)
+                      }
+                  }
+
+                  if (editMode) {
+                      for ((i, p) in pts.withIndex()) {
+                          fill.color = when (i) {
+                              0 -> 0xCCFFFFFF.toInt()
+                              pts.size - 1 -> 0xCC34C759.toInt()
+                              else -> 0xCCFFCC00.toInt()
+                          }
+                          c.drawCircle(p.x, p.y, 26f, fill)
+                      }
+                  }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (!editMode) return false
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          var best = 100f
+                          drag = -1
+                          for ((i, p) in pts.withIndex()) {
+                              val d = hypot(e.x - p.x, e.y - p.y)
+                              if (d < best) { best = d; drag = i }
+                          }
+                          return drag >= 0
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (drag >= 0) {
+                              pts[drag].x = e.x
+                              pts[drag].y = e.y
+                              invalidate()
+                          }
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> drag = -1
+                  }
+                  return true
+              }
+          }
+          EOF_2
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_3'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PoolGuide"
+          include(":app")
+          EOF_3
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_4'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_4
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_5'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_5
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_6'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.poolguide"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.poolguide"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_6
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_7'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <application
+                  android:label="Pool Guide"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false" />
+              </application>
+          </manifest>
+          EOF_7
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PoolGuide-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
