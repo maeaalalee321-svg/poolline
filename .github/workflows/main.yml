@@ -74,6 +74,7 @@ jobs:
           import android.os.IBinder
           import android.view.Gravity
           import android.view.MotionEvent
+          import android.view.View
           import android.view.WindowManager
           import android.widget.Button
           import android.widget.LinearLayout
@@ -86,25 +87,87 @@ jobs:
               private lateinit var overlayParams: WindowManager.LayoutParams
               private lateinit var panelParams: WindowManager.LayoutParams
 
+              private val handles = mutableListOf<HandleView>()
+              private var showHandles = true
+              private var destroyed = false
+              private val hs = 120
+
               override fun onBind(i: Intent?): IBinder? = null
 
               private val type get() =
                   if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                   else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
+              private fun origin(): IntArray {
+                  val l = IntArray(2)
+                  overlay.getLocationOnScreen(l)
+                  return l
+              }
+
+              private fun clearHandles() {
+                  for (h in handles) runCatching { wm.removeView(h) }
+                  handles.clear()
+              }
+
+              private fun rebuildHandles() {
+                  clearHandles()
+                  if (destroyed || !showHandles) return
+                  val o = origin()
+                  val n = overlay.pts.size
+                  for (i in 0 until n) {
+                      val p = overlay.pts[i]
+                      val col = when (i) {
+                          0 -> 0xCCFFFFFF.toInt()
+                          n - 1 -> 0xCC34C759.toInt()
+                          else -> 0xCCFFCC00.toInt()
+                      }
+                      val h = HandleView(this, col)
+                      val lp = WindowManager.LayoutParams(
+                          hs, hs, type,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT
+                      )
+                      lp.gravity = Gravity.TOP or Gravity.START
+                      lp.x = (p.x + o[0] - hs / 2).toInt()
+                      lp.y = (p.y + o[1] - hs / 2).toInt()
+                      h.onDrag = { rx, ry ->
+                          val oo = origin()
+                          p.x = rx - oo[0]
+                          p.y = ry - oo[1]
+                          lp.x = (rx - hs / 2).toInt()
+                          lp.y = (ry - hs / 2).toInt()
+                          wm.updateViewLayout(h, lp)
+                          overlay.invalidate()
+                      }
+                      wm.addView(h, lp)
+                      handles.add(h)
+                  }
+              }
+
               override fun onCreate() {
                   super.onCreate()
                   wm = getSystemService(WINDOW_SERVICE) as WindowManager
 
+                  // طبقة الخط: لا تستقبل أي لمس أبدًا، فتمر كل اللمسات إلى اللعبة
                   overlay = OverlayView(this)
                   overlayParams = WindowManager.LayoutParams(
                       -1, -1, type,
                       WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                           WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                           WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                       PixelFormat.TRANSLUCENT
                   )
+                  overlayParams.alpha = 0.75f
                   wm.addView(overlay, overlayParams)
+
+                  val dm = resources.displayMetrics
+                  val sw = dm.widthPixels
+                  val sh = dm.heightPixels
+                  overlay.reset(sw, sh)
+                  overlay.postDelayed({ rebuildHandles() }, 300)
 
                   panel = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -145,29 +208,35 @@ jobs:
                       true
                   }
 
-                  // تعديل / لعب: في وضع اللعب تمر لمساتك إلى اللعبة والخط يبقى ظاهرًا
-                  btn("✎") { b ->
-                      overlay.editMode = !overlay.editMode
-                      if (overlay.editMode) {
-                          overlayParams.flags = overlayParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                          b.text = "✎"
-                      } else {
-                          overlayParams.flags = overlayParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                          b.text = "▶"
-                      }
-                      wm.updateViewLayout(overlay, overlayParams)
-                      overlay.invalidate()
+                  // زر الطي والفرد (الجديد)
+                  val fold = btn("▲") {}
+
+                  // إظهار النقاط الملونة أو إخفاؤها (الخط يبقى ظاهرًا)
+                  val edit = btn("✎") { b ->
+                      showHandles = !showHandles
+                      b.text = if (showHandles) "✎" else "▶"
+                      rebuildHandles()
                   }
-                  btn("＋") { overlay.addBend() }
-                  btn("－") { overlay.removeBend() }
-                  btn("⟲") { overlay.reset() }
-                  btn("✕") { stopSelf() }
+                  val add = btn("＋") { overlay.addBend(); rebuildHandles() }
+                  val del = btn("－") { overlay.removeBend(); rebuildHandles() }
+                  val rst = btn("⟲") { overlay.reset(sw, sh); rebuildHandles() }
+                  val close = btn("✕") { stopSelf() }
+
+                  val others = listOf(edit, add, del, rst, close)
+                  var folded = false
+                  fold.setOnClickListener {
+                      folded = !folded
+                      for (o in others) o.visibility = if (folded) View.GONE else View.VISIBLE
+                      fold.text = if (folded) "▼" else "▲"
+                  }
 
                   wm.addView(panel, panelParams)
               }
 
               override fun onDestroy() {
                   super.onDestroy()
+                  destroyed = true
+                  clearHandles()
                   runCatching { wm.removeView(overlay) }
                   runCatching { wm.removeView(panel) }
               }
@@ -179,7 +248,6 @@ jobs:
 
           import android.content.Context
           import android.graphics.*
-          import android.view.MotionEvent
           import android.view.View
           import kotlin.math.*
 
@@ -187,8 +255,6 @@ jobs:
 
               // أول نقطة = الكرة البيضاء، آخر نقطة = الجيب، وما بينهما نقاط كسر
               val pts = mutableListOf<PointF>()
-              var editMode = true
-              private var drag = -1
 
               private val shadow = Paint().apply {
                   color = 0xAA000000.toInt(); strokeWidth = 12f
@@ -200,25 +266,20 @@ jobs:
                   style = Paint.Style.STROKE; isAntiAlias = true
                   strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND
               }
-              private val fill = Paint().apply { isAntiAlias = true }
               private val label = Paint().apply {
                   color = Color.YELLOW; textSize = 38f; isAntiAlias = true
                   setShadowLayer(5f, 0f, 0f, Color.BLACK)
               }
 
-              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
-                  super.onSizeChanged(w, h, ow, oh)
-                  if (pts.isEmpty()) reset()
-              }
-
-              fun reset() {
+              fun reset(w: Int, h: Int) {
                   pts.clear()
-                  pts.add(PointF(width * 0.3f, height * 0.65f))
-                  pts.add(PointF(width * 0.7f, height * 0.3f))
+                  pts.add(PointF(w * 0.3f, h * 0.65f))
+                  pts.add(PointF(w * 0.7f, h * 0.3f))
                   invalidate()
               }
 
               fun addBend() {
+                  if (pts.size < 2) return
                   var best = 0
                   var bestLen = -1f
                   for (i in 0 until pts.size - 1) {
@@ -264,46 +325,38 @@ jobs:
                           c.drawText("$deg°", pts[i].x + 30f, pts[i].y - 30f, label)
                       }
                   }
-
-                  if (editMode) {
-                      for ((i, p) in pts.withIndex()) {
-                          fill.color = when (i) {
-                              0 -> 0xCCFFFFFF.toInt()
-                              pts.size - 1 -> 0xCC34C759.toInt()
-                              else -> 0xCCFFCC00.toInt()
-                          }
-                          c.drawCircle(p.x, p.y, 26f, fill)
-                      }
-                  }
-              }
-
-              override fun onTouchEvent(e: MotionEvent): Boolean {
-                  if (!editMode) return false
-                  when (e.action) {
-                      MotionEvent.ACTION_DOWN -> {
-                          var best = 100f
-                          drag = -1
-                          for ((i, p) in pts.withIndex()) {
-                              val d = hypot(e.x - p.x, e.y - p.y)
-                              if (d < best) { best = d; drag = i }
-                          }
-                          return drag >= 0
-                      }
-                      MotionEvent.ACTION_MOVE -> {
-                          if (drag >= 0) {
-                              pts[drag].x = e.x
-                              pts[drag].y = e.y
-                              invalidate()
-                          }
-                      }
-                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> drag = -1
-                  }
-                  return true
               }
           }
           EOF_2
+          mkdir -p $(dirname app/src/main/java/com/example/poolguide/HandleView.kt)
+          cat > app/src/main/java/com/example/poolguide/HandleView.kt <<'EOF_3'
+          package com.example.poolguide
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.view.MotionEvent
+          import android.view.View
+
+          // نقطة ملونة صغيرة هي نافذة مستقلة، فلا تحجب إلا مكانها هي
+          class HandleView(ctx: Context, private val colorInt: Int) : View(ctx) {
+
+              private val p = Paint().apply { isAntiAlias = true }
+              var onDrag: ((Float, Float) -> Unit)? = null
+
+              override fun onDraw(c: Canvas) {
+                  p.color = colorInt
+                  c.drawCircle(width / 2f, height / 2f, 26f, p)
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (e.action == MotionEvent.ACTION_MOVE) onDrag?.invoke(e.rawX, e.rawY)
+                  return true
+              }
+          }
+          EOF_3
           mkdir -p $(dirname settings.gradle.kts)
-          cat > settings.gradle.kts <<'EOF_3'
+          cat > settings.gradle.kts <<'EOF_4'
           pluginManagement {
               repositories { google(); mavenCentral(); gradlePluginPortal() }
           }
@@ -312,21 +365,21 @@ jobs:
           }
           rootProject.name = "PoolGuide"
           include(":app")
-          EOF_3
+          EOF_4
           mkdir -p $(dirname build.gradle.kts)
-          cat > build.gradle.kts <<'EOF_4'
+          cat > build.gradle.kts <<'EOF_5'
           plugins {
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
-          EOF_4
+          EOF_5
           mkdir -p $(dirname gradle.properties)
-          cat > gradle.properties <<'EOF_5'
+          cat > gradle.properties <<'EOF_6'
           android.useAndroidX=true
           org.gradle.jvmargs=-Xmx2g
-          EOF_5
+          EOF_6
           mkdir -p $(dirname app/build.gradle.kts)
-          cat > app/build.gradle.kts <<'EOF_6'
+          cat > app/build.gradle.kts <<'EOF_7'
           plugins {
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
@@ -338,8 +391,8 @@ jobs:
                   applicationId = "com.example.poolguide"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0"
+                  versionCode = 3
+                  versionName = "3.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -347,9 +400,9 @@ jobs:
               }
               kotlinOptions { jvmTarget = "17" }
           }
-          EOF_6
+          EOF_7
           mkdir -p $(dirname app/src/main/AndroidManifest.xml)
-          cat > app/src/main/AndroidManifest.xml <<'EOF_7'
+          cat > app/src/main/AndroidManifest.xml <<'EOF_8'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -365,7 +418,7 @@ jobs:
                   <service android:name=".OverlayService" android:exported="false" />
               </application>
           </manifest>
-          EOF_7
+          EOF_8
       - name: Build
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
